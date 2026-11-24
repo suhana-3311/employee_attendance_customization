@@ -1,0 +1,1007 @@
+diff --git a/frontend/package.json b/frontend/package.json
+index e0ebd4c3..c373a5be 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -14,6 +14,7 @@
+ 	"dependencies": {
+ 		"@ionic/vue": "^7.4.3",
+ 		"@ionic/vue-router": "^7.4.3",
++		"@mediapipe/tasks-vision": "^1.2.2",
+ 		"@vitejs/plugin-vue": "^4.4.0",
+ 		"autoprefixer": "^10.4.19",
+ 		"dayjs": "^1.11.11",
+diff --git a/frontend/src/components/CheckInPanel.vue b/frontend/src/components/CheckInPanel.vue
+index 8451c81d..e6ba1e3f 100644
+--- a/frontend/src/components/CheckInPanel.vue
++++ b/frontend/src/components/CheckInPanel.vue
+@@ -12,6 +12,7 @@
+ 					<span @click="navigate" class="underline">{{ __("View List") }}</span>
+ 				</router-link>
+ 			</div>
++
+ 			<Button
+ 				class="mt-4 mb-1 drop-shadow-sm py-5 text-base"
+ 				id="open-checkin-modal"
+@@ -39,6 +40,8 @@
+ 		trigger="open-checkin-modal"
+ 		:initial-breakpoint="1"
+ 		:breakpoints="[0, 1]"
++		@ionModalDidPresent="handleModalDidPresent"
++		@ionModalDidDismiss="handleModalDidDismiss"
+ 	>
+ 		<div class="h-120 w-full flex flex-col items-center justify-center gap-5 p-4 mb-5">
+ 			<div class="flex flex-col gap-1.5 mt-2 items-center justify-center">
+@@ -50,36 +53,175 @@
+ 				</div>
+ 			</div>
+ 
+-			<template v-if="settings.data?.allow_geolocation_tracking">
+-				<span v-if="locationStatus" class="font-medium text-gray-500 text-sm">
+-					{{ locationStatus }}
+-				</span>
+-
+-				<div class="rounded border-4 translate-z-0 block overflow-hidden w-full h-170">
+-					<iframe
+-						width="100%"
+-						height="170"
+-						frameborder="0"
+-						scrolling="no"
+-						marginheight="0"
+-						marginwidth="0"
+-						style="border: 0"
+-						:src="`https://maps.google.com/maps?q=${latitude},${longitude}&hl=en&z=15&amp;output=embed`"
+-					>
+-					</iframe>
++			<!-- Live selfie verification (same screen for Check In and Check Out) -->
++			<div class="w-full flex flex-col gap-3">
++				<div class="font-semibold text-sm text-gray-800">
++					{{ __("Selfie Verification") }}
++				</div>
++
++				<!-- Live camera with circular face guide -->
++				<div
++					v-if="!selfiePreview"
++					class="relative w-full aspect-[4/3] rounded-lg overflow-hidden bg-gray-900"
++				>
++					<video
++						ref="videoElement"
++						autoplay
++						playsinline
++						muted
++						class="w-full h-full object-fill"
++					></video>
++
++					<div
++						class="absolute rounded-full border-4 border-white pointer-events-none"
++						style="
++							width: 68%;
++							aspect-ratio: 1;
++							left: 16%;
++							top: 50%;
++							transform: translateY(-50%);
++							box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.25);
++						"
++					></div>
++				</div>
++
++				<!-- Captured selfie preview -->
++				<div v-else class="w-full rounded-lg overflow-hidden bg-gray-100">
++					<img
++						:src="selfiePreview"
++						alt="Selfie preview"
++						class="w-full h-auto object-contain"
++						style="max-height: 300px"
++					/>
++				</div>
++
++				<div v-if="cameraLoading" class="text-sm text-gray-500 text-center">
++					{{ __("Opening camera and preparing face detection...") }}
++				</div>
++
++				<div v-if="cameraError" class="text-sm text-red-600 text-center">
++					{{ cameraError }}
++				</div>
++
++				<!-- Red warning for hands and fingers -->
++				<div
++					v-if="!selfiePreview && handWarning"
++					class="rounded-lg border border-red-300 bg-red-50 px-3 py-3 text-center text-sm font-bold text-red-700"
++				>
++					{{ __("HAND DETECTED — REMOVE YOUR HAND OR FINGERS FROM THE CAMERA") }}
++				</div>
++
++				<!-- Live face guidance -->
++				<div
++					v-if="!selfiePreview"
++					class="text-sm text-center font-medium text-blue-700"
++				>
++					{{ faceStatus }}
+ 				</div>
+-			</template>
+ 
+-			<Button :loading="checkins.insert.loading" variant="solid" class="w-full py-5 text-sm disabled:bg-gray-700" @click="submitLog(nextAction.action)">
++				<Button
++					v-if="selfiePreview"
++					class="w-full py-4"
++					variant="outline"
++					@click="retakeSelfie"
++				>
++					{{ __("Retake Selfie") }}
++				</Button>
++
++				<div v-if="selfiePreview" class="text-xs text-green-600 text-center">
++					{{ __("Selfie captured. It will upload when you confirm.") }}
++				</div>
++			</div>
++
++			<Button
++				:loading="selfieUploading"
++				:disabled="!selfieBlob || selfieUploading || cameraLoading"
++				variant="solid"
++				class="w-full py-5 text-sm disabled:bg-gray-700"
++				@click="submitLog(nextAction.action)"
++			>
+ 				{{ __("Confirm {0}", [nextAction.label]) }}
+ 			</Button>
+ 		</div>
+ 	</ion-modal>
+ </template>
+ 
++<script>
++// Detection models are created once and shared, so the camera opens quickly
++// after the first time. The files are served by the
++// employee_attendance_customization app, so no internet access is needed.
++import { FaceLandmarker, HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision"
++
++const ASSET_BASE = "/assets/employee_attendance_customization/vendor/mediapipe"
++const USE_GPU = true // falls back to CPU automatically if the GPU is unavailable
++
++let detectorsPromise = null
++
++async function buildDetectors(vision, delegate) {
++	const [face, hand] = await Promise.allSettled([
++		FaceLandmarker.createFromOptions(vision, {
++			baseOptions: { modelAssetPath: `${ASSET_BASE}/models/face_landmarker.task`, delegate },
++			runningMode: "VIDEO",
++			numFaces: 2,
++			minFaceDetectionConfidence: 0.5,
++			minFacePresenceConfidence: 0.5,
++			minTrackingConfidence: 0.5,
++		}),
++		HandLandmarker.createFromOptions(vision, {
++			baseOptions: { modelAssetPath: `${ASSET_BASE}/models/hand_landmarker.task`, delegate },
++			runningMode: "VIDEO",
++			numHands: 2,
++			minHandDetectionConfidence: 0.3,
++			minHandPresenceConfidence: 0.3,
++			minTrackingConfidence: 0.3,
++		}),
++	])
++
++	if (face.status === "fulfilled" && hand.status === "fulfilled") {
++		return { face: face.value, hand: hand.value }
++	}
++
++	if (face.status === "fulfilled") face.value.close()
++	if (hand.status === "fulfilled") hand.value.close()
++	throw face.status === "rejected" ? face.reason : hand.reason
++}
++
++async function createDetectors() {
++	const vision = await FilesetResolver.forVisionTasks(`${ASSET_BASE}/wasm`)
++
++	if (USE_GPU) {
++		try {
++			return await buildDetectors(vision, "GPU")
++		} catch (error) {
++			console.warn("GPU face detection unavailable, using CPU instead.", error)
++		}
++	}
++
++	return buildDetectors(vision, "CPU")
++}
++
++function getDetectors() {
++	if (!detectorsPromise) {
++		detectorsPromise = createDetectors().catch((error) => {
++			detectorsPromise = null
++			throw error
++		})
++	}
++	return detectorsPromise
++}
++</script>
++
+ <script setup>
+-import { createListResource, toast, FeatherIcon } from "frappe-ui"
+-import { computed, inject, ref, onMounted, onBeforeUnmount } from "vue"
++import { createListResource, createResource, toast, FeatherIcon } from "frappe-ui"
++import {
++	computed,
++	inject,
++	ref,
++	watch,
++	onMounted,
++	onBeforeUnmount,
++	nextTick,
++} from "vue"
+ import { IonModal, modalController } from "@ionic/vue"
+ 
+ import { formatTimestamp } from "@/utils/formatters"
+@@ -87,15 +229,61 @@ import { settings } from "@/data/settings"
+ 
+ const DOCTYPE = "Employee Checkin"
+ 
++// Capture tuning
++const REQUIRED_GOOD_FRAMES = 3 // consecutive good frames before capture
++const MAX_BAD_FRAMES = 2 // tolerated bad frames (blinks, jitter) before restarting the count
++const WARMUP_MS = 300 // let camera exposure settle before capturing
++const MIN_FACE_HEIGHT = 0.28 // minimum face height as a fraction of the frame
++const CIRCLE_RX = 0.34 // guide circle radius as a fraction of frame width (68% wide guide)
++const CIRCLE_RY = 0.34 * (4 / 3) // same circle as a fraction of frame height (4:3 box)
++const CIRCLE_TOLERANCE = 1.08
++const BURST_FRAMES = 3 // frames grabbed at capture; the sharpest one is kept
++const SHARPNESS_GOOD = 55 // stop early when a frame is this sharp
++const SHARPNESS_MIN = 35 // reject the capture below this
++const MAX_DRIFT = 10 // max average picture change between lock and capture (a hand moving in changes it a lot)
++const HAND_COOLDOWN_MS = 800 // keep blocking capture for a moment after a hand was seen
++const SMALL_W = 64
++const SMALL_H = 48
++
+ const socket = inject("$socket")
+ const employee = inject("$employee")
+ const dayjs = inject("$dayjs")
+ const __ = inject("$translate")
++
++const DEFAULT_STATUS = __(
++	"Fit your face inside the circle. We will automatically capture your selfie."
++)
++
+ const checkinTimestamp = ref(null)
+-const latitude = ref(0)
+-const longitude = ref(0)
+-const locationStatus = ref("")
+ 
++// Selfie state
++const videoElement = ref(null)
++const cameraStream = ref(null)
++const selfieBlob = ref(null)
++const selfiePreview = ref("")
++const selfieUploading = ref(false)
++const cameraLoading = ref(false)
++const cameraError = ref("")
++const faceStatus = ref(DEFAULT_STATUS)
++const handWarning = ref(false)
++
++// Detection loop state (not reactive on purpose)
++let detectors = null
++let rafId = null
++let session = 0
++let isCapturing = false
++let goodFrames = 0
++let badFrames = 0
++let frameCount = 0
++let handSeen = false
++let lastVideoTime = -1
++let warmupUntil = 0
++let handBlockUntil = 0
++let lockFrame = null
++let lastTimestamp = 0
++let smallCanvas = null
++
++// Employee Checkin list (used for last log and next action)
+ const checkins = createListResource({
+ 	doctype: DOCTYPE,
+ 	fields: ["name", "employee", "employee_name", "log_type", "time", "device_id"],
+@@ -104,6 +292,7 @@ const checkins = createListResource({
+ 	},
+ 	orderBy: "time desc",
+ })
++
+ checkins.reload()
+ 
+ const lastLog = computed(() => {
+@@ -121,90 +310,627 @@ const nextAction = computed(() => {
+ 		: { action: "IN", label: __("Check In") }
+ })
+ 
+-function handleLocationSuccess(position) {
+-	latitude.value = position.coords.latitude
+-	longitude.value = position.coords.longitude
++// Backend API (employee_attendance_customization app)
++const selfieCheckin = createResource({
++	url: "employee_attendance_customization.attendance.create_checkin_with_selfie",
++	method: "POST",
++
++	onSuccess(data) {
++		selfieUploading.value = false
++
++		if (!data?.name) {
++			toast({
++				title: __("Error"),
++				text: __("Check In failed. Please try again."),
++				icon: "alert-circle",
++				position: "bottom-center",
++				iconClasses: "text-red-500",
++			})
++			return
++		}
++
++		checkins.reload()
++		modalController.dismiss()
++
++		toast({
++			title: __("Success"),
++			text:
++				data.log_type === "OUT"
++					? __("Check Out successful!")
++					: __("Check In successful!"),
++			icon: "check-circle",
++			position: "bottom-center",
++			iconClasses: "text-green-500",
++		})
++	},
++
++	onError(error) {
++		selfieUploading.value = false
++
++		const messages = error?.messages?.length
++			? error.messages
++			: [__("Check In failed. Please try again.")]
++
++		for (const message of messages) {
++			toast({
++				title: __("Error"),
++				text: message,
++				icon: "alert-circle",
++				position: "bottom-center",
++				iconClasses: "text-red-500",
++			})
++		}
++	},
++})
++
++// Warm up the detection models in the background once check-in is enabled
++watch(
++	() => settings.data?.allow_employee_checkin_from_mobile_app,
++	(enabled) => {
++		if (enabled) {
++			setTimeout(() => getDetectors().catch(() => {}), 1000)
++		}
++	},
++	{ immediate: true }
++)
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
+ 
+-	locationStatus.value = [
+-		__("Latitude: {0}°", [Number(latitude.value).toFixed(5)]),
+-		__("Longitude: {0}°", [Number(longitude.value).toFixed(5)]),
+-	].join(", ")
++// MediaPipe needs strictly increasing timestamps
++function nextTimestamp() {
++	lastTimestamp = Math.max(performance.now(), lastTimestamp + 1)
++	return lastTimestamp
+ }
+ 
+-function handleLocationError(error) {
+-	locationStatus.value = __("Unable to retrieve your location")
+-	if (error) locationStatus.value += `: ERROR(${error.code}): ${error.message}`
++// Tiny grayscale copy of a frame, used to notice sudden changes in the picture
++function getSmallFrame(source) {
++	if (!smallCanvas) {
++		smallCanvas = document.createElement("canvas")
++		smallCanvas.width = SMALL_W
++		smallCanvas.height = SMALL_H
++	}
++
++	const context = smallCanvas.getContext("2d", { willReadFrequently: true })
++	context.drawImage(source, 0, 0, SMALL_W, SMALL_H)
++
++	const data = context.getImageData(0, 0, SMALL_W, SMALL_H).data
++	const gray = new Uint8Array(SMALL_W * SMALL_H)
++
++	for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
++		gray[i] = (data[p] * 77 + data[p + 1] * 150 + data[p + 2] * 29) >> 8
++	}
++
++	return gray
++}
++
++// Average brightness change between two small frames (0..255)
++function frameChange(a, b) {
++	let sum = 0
++	for (let i = 0; i < a.length; i++) {
++		sum += Math.abs(a[i] - b[i])
++	}
++	return sum / a.length
++}
++
++// ---------------------------------------------------------------------------
++// Camera
++// ---------------------------------------------------------------------------
++
++async function startCamera() {
++	stopCamera()
++	const currentSession = ++session
++
++	cameraError.value = ""
++	handWarning.value = false
++	faceStatus.value = DEFAULT_STATUS
++
++	if (!navigator.mediaDevices?.getUserMedia) {
++		cameraError.value = __("Camera requires HTTPS or localhost.")
++		return
++	}
++
++	cameraLoading.value = true
++
++	// Start loading the models while the camera is opening
++	const detectorsPromise = getDetectors()
++	detectorsPromise.catch(() => {})
++
++	try {
++		const stream = await navigator.mediaDevices.getUserMedia({
++			audio: false,
++			video: {
++				facingMode: { ideal: "user" },
++				width: { ideal: 1280 },
++				height: { ideal: 960 },
++				advanced: [{ focusMode: "continuous" }],
++			},
++		})
++
++		if (currentSession !== session) {
++			stream.getTracks().forEach((track) => track.stop())
++			return
++		}
++
++		cameraStream.value = stream
++		await nextTick()
++
++		if (!videoElement.value) {
++			throw new Error(__("Camera preview is not available."))
++		}
++
++		videoElement.value.srcObject = stream
++		await videoElement.value.play()
++
++		const loaded = await detectorsPromise
++		if (currentSession !== session) return
++
++		detectors = loaded
++		warmupUntil = performance.now() + WARMUP_MS
++		detectLoop()
++	} catch (error) {
++		if (currentSession !== session) return
++
++		if (error?.name === "NotAllowedError") {
++			cameraError.value = __("Camera permission was denied. Please allow camera access.")
++		} else if (error?.name === "NotFoundError") {
++			cameraError.value = __("No camera was found on this device.")
++		} else {
++			cameraError.value =
++				error?.message ||
++				__("Unable to start camera or face detection. Please try again.")
++		}
++
++		stopCamera()
++	} finally {
++		if (currentSession === session) {
++			cameraLoading.value = false
++		}
++	}
+ }
+ 
+-const fetchLocation = () => {
+-	if (!navigator.geolocation) {
+-		locationStatus.value = __("Geolocation is not supported by your current browser")
+-	} else {
+-		locationStatus.value = __("Locating...")
+-		navigator.geolocation.getCurrentPosition(handleLocationSuccess, handleLocationError)
++function stopCamera() {
++	session++
++
++	if (rafId !== null) {
++		cancelAnimationFrame(rafId)
++		rafId = null
++	}
++
++	if (cameraStream.value) {
++		cameraStream.value.getTracks().forEach((track) => track.stop())
++		cameraStream.value = null
++	}
++
++	if (videoElement.value) {
++		videoElement.value.srcObject = null
+ 	}
++
++	// The shared detection models stay loaded for the next Check In / Check Out
++	detectors = null
++	goodFrames = 0
++	badFrames = 0
++	frameCount = 0
++	handSeen = false
++	lastVideoTime = -1
++	handBlockUntil = 0
++	lockFrame = null
++	isCapturing = false
++	cameraLoading.value = false
++}
++
++// ---------------------------------------------------------------------------
++// Face checks (all coordinates are normalized 0..1)
++// ---------------------------------------------------------------------------
++
++function getFaceBox(points) {
++	let left = 1
++	let right = 0
++	let top = 1
++	let bottom = 0
++
++	for (const point of points) {
++		if (point.x < left) left = point.x
++		if (point.x > right) right = point.x
++		if (point.y < top) top = point.y
++		if (point.y > bottom) bottom = point.y
++	}
++
++	return { left, right, top, bottom }
++}
++
++// Whole face must sit inside the on-screen circle (matches the drawn guide)
++function isFaceInsideCircle(box) {
++	const rx = CIRCLE_RX * CIRCLE_TOLERANCE
++	const ry = CIRCLE_RY * CIRCLE_TOLERANCE
++
++	return [
++		[box.left, box.top],
++		[box.right, box.top],
++		[box.left, box.bottom],
++		[box.right, box.bottom],
++	].every(([x, y]) => ((x - 0.5) / rx) ** 2 + ((y - 0.5) / ry) ** 2 <= 1)
++}
++
++function areEyesOpen(points) {
++	const leftWidth = Math.hypot(points[33].x - points[133].x, points[33].y - points[133].y)
++	const leftHeight = Math.hypot(points[159].x - points[145].x, points[159].y - points[145].y)
++	const rightWidth = Math.hypot(points[362].x - points[263].x, points[362].y - points[263].y)
++	const rightHeight = Math.hypot(points[386].x - points[374].x, points[386].y - points[374].y)
++
++	if (!leftWidth || !rightWidth) return false
++
++	return leftHeight / leftWidth > 0.1 && rightHeight / rightWidth > 0.1
+ }
+ 
++function isFacingCamera(points) {
++	const leftEye = points[33]
++	const rightEye = points[263]
++	const nose = points[1]
++
++	const eyeCenterX = (leftEye.x + rightEye.x) / 2
++	const eyeWidth = Math.abs(rightEye.x - leftEye.x)
++
++	if (!eyeWidth) return false
++
++	const yawDeviation = Math.abs(nose.x - eyeCenterX) / eyeWidth
++	const tilt = Math.abs(
++		Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * (180 / Math.PI)
++	)
++
++	return yawDeviation < 0.25 && tilt < 15
++}
++
++// Sharpness score: variance of the Laplacian (higher = sharper)
++function getSharpness(context, width, height) {
++	const pixels = context.getImageData(0, 0, width, height).data
++	const gray = new Float32Array(width * height)
++
++	for (let i = 0; i < width * height; i++) {
++		const p = i * 4
++		gray[i] = 0.299 * pixels[p] + 0.587 * pixels[p + 1] + 0.114 * pixels[p + 2]
++	}
++
++	let sum = 0
++	let sumSquared = 0
++	let count = 0
++
++	for (let y = 1; y < height - 1; y++) {
++		for (let x = 1; x < width - 1; x++) {
++			const i = y * width + x
++			const laplacian =
++				4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - width] - gray[i + width]
++
++			sum += laplacian
++			sumSquared += laplacian * laplacian
++			count++
++		}
++	}
++
++	if (!count) return 0
++
++	const mean = sum / count
++	return sumSquared / count - mean * mean
++}
++
++// ---------------------------------------------------------------------------
++// Detection loop (same rules for Check In and Check Out)
++// ---------------------------------------------------------------------------
++
++function rejectFrame(message, handDetected = false, forceReset = false) {
++	badFrames++
++
++	if (handDetected || forceReset || badFrames >= MAX_BAD_FRAMES) {
++		goodFrames = 0
++		lockFrame = null
++	}
++
++	handWarning.value = handDetected
++	faceStatus.value = message
++}
++
++function evaluateFrame(video) {
++	const small = getSmallFrame(video)
++	const faces = detectors.face.detectForVideo(video, nextTimestamp()).faceLandmarks || []
++
++	// Strict rule: any hand anywhere in the frame blocks capture.
++	// The hand check runs every frame while a capture is building, otherwise on alternate frames.
++	frameCount++
++	if (goodFrames > 0 || frameCount % 2 === 1) {
++		handSeen =
++			(detectors.hand.detectForVideo(video, nextTimestamp()).landmarks || []).length > 0
++
++		if (handSeen) {
++			handBlockUntil = performance.now() + HAND_COOLDOWN_MS
++		}
++	}
++
++	if (handSeen || performance.now() < handBlockUntil) {
++		return rejectFrame(__("Remove your hand or fingers from the camera."), true)
++	}
++
++	if (faces.length === 0) {
++		return rejectFrame(DEFAULT_STATUS)
++	}
++
++	if (faces.length > 1) {
++		return rejectFrame(__("Multiple faces detected. Only one person is allowed."))
++	}
++
++	const points = faces[0]
++	const box = getFaceBox(points)
++
++	if (!isFaceInsideCircle(box)) {
++		return rejectFrame(__("Move your complete face inside the circle."))
++	}
++
++	if (box.bottom - box.top < MIN_FACE_HEIGHT) {
++		return rejectFrame(__("Move closer to the camera."))
++	}
++
++	if (!areEyesOpen(points)) {
++		return rejectFrame(__("Keep both eyes open and visible."))
++	}
++
++	if (!isFacingCamera(points)) {
++		return rejectFrame(__("Look directly at the camera. Keep your head straight."))
++	}
++
++	// The picture must stay steady while the capture builds up.
++	// Something moving in front of the lens changes it a lot.
++	if (goodFrames === 0 || !lockFrame) {
++		lockFrame = small
++	} else if (frameChange(lockFrame, small) > MAX_DRIFT) {
++		return rejectFrame(__("Hold still. Something is moving in front of the camera."), false, true)
++	}
++
++	badFrames = 0
++	handWarning.value = false
++	faceStatus.value = DEFAULT_STATUS
++	goodFrames++
++
++	if (goodFrames >= REQUIRED_GOOD_FRAMES) {
++		isCapturing = true
++		faceStatus.value = __("Capturing your selfie...")
++		captureSelfie()
++	}
++}
++
++function detectLoop() {
++	const video = videoElement.value
++
++	if (!video || !detectors || selfiePreview.value || isCapturing) return
++
++	const now = performance.now()
++
++	// Only analyse a new video frame once, after the short warm-up
++	if (
++		now >= warmupUntil &&
++		video.readyState >= 2 &&
++		video.videoWidth &&
++		video.currentTime !== lastVideoTime
++	) {
++		lastVideoTime = video.currentTime
++
++		try {
++			evaluateFrame(video)
++		} catch (error) {
++			goodFrames = 0
++			faceStatus.value = __("Face detection error. Please try again.")
++		}
++
++		if (isCapturing) return
++	}
++
++	rafId = requestAnimationFrame(detectLoop)
++}
++
++// ---------------------------------------------------------------------------
++// Capture
++// ---------------------------------------------------------------------------
++
++function grabFrame(video) {
++	const canvas = document.createElement("canvas")
++	canvas.width = video.videoWidth
++	canvas.height = video.videoHeight
++
++	const context = canvas.getContext("2d", { willReadFrequently: true })
++	if (!context) return null
++
++	context.drawImage(video, 0, 0, canvas.width, canvas.height)
++
++	return { canvas, sharpness: getSharpness(context, canvas.width, canvas.height) }
++}
++
++function resumeDetection(message, handDetected = false) {
++	isCapturing = false
++	goodFrames = 0
++	badFrames = 0
++	lockFrame = null
++	handWarning.value = handDetected
++	faceStatus.value = message
++	detectLoop()
++}
++
++// Final check on the exact picture that is about to be saved
++function verifyCapturedFrame(canvas) {
++	if (!detectors) return null
++
++	try {
++		if ((detectors.hand.detectForVideo(canvas, nextTimestamp()).landmarks || []).length) {
++			handBlockUntil = performance.now() + HAND_COOLDOWN_MS
++			return { message: __("Remove your hand or fingers from the camera."), hand: true }
++		}
++
++		const faces = detectors.face.detectForVideo(canvas, nextTimestamp()).faceLandmarks || []
++
++		if (faces.length !== 1 || !isFaceInsideCircle(getFaceBox(faces[0]))) {
++			return { message: __("Move your complete face inside the circle."), hand: false }
++		}
++
++		if (lockFrame && frameChange(lockFrame, getSmallFrame(canvas)) > MAX_DRIFT) {
++			return {
++				message: __("Hold still. Something is moving in front of the camera."),
++				hand: false,
++			}
++		}
++	} catch (error) {
++		// Never block a check-in because the extra verification itself failed
++		return null
++	}
++
++	return null
++}
++
++// Grab a few frames and keep the sharpest one
++async function captureSelfie() {
++	const video = videoElement.value
++	let best = null
++
++	for (let attempt = 0; attempt < BURST_FRAMES; attempt++) {
++		if (!video || !video.videoWidth || !cameraStream.value) break
++
++		const frame = grabFrame(video)
++		if (frame && (!best || frame.sharpness > best.sharpness)) best = frame
++		if (best && best.sharpness >= SHARPNESS_GOOD) break
++
++		await new Promise((resolve) => setTimeout(resolve, 120))
++	}
++
++	// Camera was closed while capturing
++	if (!cameraStream.value) return
++
++	if (!best || best.sharpness < SHARPNESS_MIN) {
++		resumeDetection(__("Image is blurry. Hold still and look at the camera."))
++		return
++	}
++
++	const problem = verifyCapturedFrame(best.canvas)
++	if (problem) {
++		resumeDetection(problem.message, problem.hand)
++		return
++	}
++
++	const blob = await new Promise((resolve) => best.canvas.toBlob(resolve, "image/jpeg", 0.9))
++
++	if (!cameraStream.value) return
++
++	if (!blob) {
++		cameraError.value = __("Unable to capture selfie.")
++		resumeDetection(DEFAULT_STATUS)
++		return
++	}
++
++	clearSelfie()
++	selfieBlob.value = blob
++	selfiePreview.value = URL.createObjectURL(blob)
++	cameraError.value = ""
++
++	stopCamera()
++	faceStatus.value = __("Selfie captured successfully.")
++}
++
++function clearSelfie() {
++	if (selfiePreview.value) {
++		URL.revokeObjectURL(selfiePreview.value)
++	}
++
++	selfiePreview.value = ""
++	selfieBlob.value = null
++}
++
++function retakeSelfie() {
++	clearSelfie()
++	cameraError.value = ""
++	handWarning.value = false
++	faceStatus.value = DEFAULT_STATUS
++	startCamera()
++}
++
++function blobToBase64(blob) {
++	return new Promise((resolve, reject) => {
++		const reader = new FileReader()
++
++		reader.onload = () => {
++			resolve(String(reader.result).split(",")[1])
++		}
++
++		reader.onerror = () => {
++			reject(new Error("Unable to read selfie image."))
++		}
++
++		reader.readAsDataURL(blob)
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Modal and submit
++// ---------------------------------------------------------------------------
++
+ const handleEmployeeCheckin = () => {
+ 	checkinTimestamp.value = dayjs().format("YYYY-MM-DD HH:mm:ss")
+ 
+-	if (settings.data?.allow_geolocation_tracking) {
+-		fetchLocation()
+-	}
++	clearSelfie()
++	cameraError.value = ""
++	handWarning.value = false
++	faceStatus.value = DEFAULT_STATUS
++
++	// No-op if the models are already loaded
++	getDetectors().catch(() => {})
++}
++
++function handleModalDidPresent() {
++	startCamera()
++}
++
++function handleModalDidDismiss() {
++	stopCamera()
++	clearSelfie()
++	cameraError.value = ""
++	handWarning.value = false
++	faceStatus.value = DEFAULT_STATUS
+ }
+ 
+-const submitLog = (logType) => {
++const submitLog = async (logType) => {
+ 	const actionLabel = logType === "IN" ? __("Check-in") : __("Check-out")
+ 
+-	checkins.insert.submit(
+-		{
+-			employee: employee.data.name,
++	if (!selfieBlob.value) {
++		toast({
++			title: __("Selfie Required"),
++			text: __("Please wait for the automatic selfie capture before continuing."),
++			icon: "alert-circle",
++			position: "bottom-center",
++			iconClasses: "text-red-500",
++		})
++		return
++	}
++
++	selfieUploading.value = true
++
++	try {
++		const selfieBase64 = await blobToBase64(selfieBlob.value)
++
++		selfieCheckin.submit({
++			selfie_base64: selfieBase64,
+ 			log_type: logType,
+-			time: checkinTimestamp.value,
+-			latitude: latitude.value,
+-			longitude: longitude.value,
+-		},
+-		{
+-			onSuccess(data) {
+-				if (!data?.name) {
+-					toast({
+-						title: __("Error"),
+-						text: __("{0} failed!", [actionLabel]),
+-						icon: "alert-circle",
+-						position: "bottom-center",
+-						iconClasses: "text-red-500",
+-					})
+-					return
+-				}
+-
+-				modalController.dismiss()
+-				toast({
+-					title: __("Success"),
+-					text: __("{0} successful!", [actionLabel]),
+-					icon: "check-circle",
+-					position: "bottom-center",
+-					iconClasses: "text-green-500",
+-				})
+-			},
+-			onError(error) {
+-				let messages = error.messages?.length ? error.messages : [__("{0} failed!", [actionLabel])]
+-
+-				for (const message of messages) {
+-					toast({
+-						title: __("Error"),
+-						text: message || __("{0} failed!", [actionLabel]),
+-						icon: "alert-circle",
+-						position: "bottom-center",
+-						iconClasses: "text-red-500",
+-					})
+-				}
+-			},
+-		}
+-	)
++		})
++	} catch (error) {
++		selfieUploading.value = false
++
++		toast({
++			title: __("Error"),
++			text: error?.message || __("{0} failed.", [actionLabel]),
++			icon: "alert-circle",
++			position: "bottom-center",
++			iconClasses: "text-red-500",
++		})
++	}
+ }
+ 
+ onMounted(() => {
+ 	socket.emit("doctype_subscribe", DOCTYPE)
++
+ 	socket.on("list_update", (data) => {
+ 		if (data.doctype == DOCTYPE) {
+ 			checkins.reload()
+@@ -213,7 +939,9 @@ onMounted(() => {
+ })
+ 
+ onBeforeUnmount(() => {
++	stopCamera()
++	clearSelfie()
+ 	socket.emit("doctype_unsubscribe", DOCTYPE)
+ 	socket.off("list_update")
+ })
+-</script>
++</script>
+\ No newline at end of file

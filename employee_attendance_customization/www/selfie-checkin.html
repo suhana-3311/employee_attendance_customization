@@ -1,0 +1,37 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ _("Selfie Check-In") }}{% endblock %}
+
+{% block page_content %}
+<link rel="stylesheet" href="/assets/employee_attendance_customization/css/selfie_checkin.css">
+
+<div class="sc" id="sc" data-next="{{ next_action or '' }}" data-csrf="{{ csrf_token or '' }}">
+  {% if error %}
+    <div class="alert alert-danger">{{ error }}</div>
+  {% else %}
+    <h3 class="sc-title" id="sc-title">Selfie Check-In</h3>
+    <p class="sc-sub" id="sc-name"></p>
+
+    <div id="sc-stage" class="sc-stage" hidden>
+      <video id="sc-video" playsinline muted autoplay></video>
+      <svg class="sc-guide" viewBox="0 0 1 1" preserveAspectRatio="none">
+        <path fill-rule="evenodd" fill="rgba(0,0,0,0.45)"
+          d="M0 0H1V1H0Z M0.16 0.5 a0.34 0.45333 0 1 0 0.68 0 a0.34 0.45333 0 1 0 -0.68 0Z"/>
+        <ellipse cx="0.5" cy="0.5" rx="0.34" ry="0.45333"/>
+      </svg>
+    </div>
+    <img id="sc-preview" class="sc-preview" alt="Selfie preview" hidden>
+
+    <p id="sc-status" class="sc-status"></p>
+
+    <div class="sc-actions">
+      <button id="sc-start" class="btn btn-primary btn-lg">{{ _("Start camera") }}</button>
+      <button id="sc-retake" class="btn btn-default" hidden>{{ _("Retake") }}</button>
+      <button id="sc-submit" class="btn btn-primary" hidden>{{ _("Submit") }}</button>
+      <button id="sc-done" class="btn btn-primary" hidden>{{ _("Done") }}</button>
+    </div>
+
+    <script type="module" src="/assets/employee_attendance_customization/js/selfie_checkin.js"></script>
+  {% endif %}
+</div>
+{% endblock %}
